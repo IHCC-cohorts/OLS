@@ -49,7 +49,7 @@
                     </div>
                         <span class="examples">Examples: <a class="nounderline ontology-link" href="search?q=diabetes">diabetes</a>,
                              <a class="nounderline ontology-link" href="search?q=GO:0098743">GO:0098743</a></span>
-                        <span style="float: right;" class="examples"><a class="nounderline ontology-link" href="ontologies">Looking for a particular ontology?</a>
+                        <span style="float: right;" class="examples"><a class="nounderline ontology-link" href="ontologies" th:inline="text">Looking for a particular [[${ontologyAlias.toLowerCase()}]]?</a>
                          </span>
                 </form>
             </div>
@@ -85,18 +85,24 @@
 
                 <div class="small-4 columns">
                     <h4>
-                        <i style="color: #BF8230;" class="icon icon-generic" data-icon="C"></i>
-                        <a href="contact">Contact Us</a>
+                        <i style="color: #BF8230;" class="icon icon-generic" data-icon="l"></i>
+                        <a href="https://github.com/EBISPOT/OLS/issues">Report an Issue</a>
                     </h4>
                     <p class="about">
-                        For feedback, enquiries or suggestion about OLS or to request a new ontology please contact
-                        ols-support @ ebi.ac.uk. For bugs or problems with the code or API please report on
-                        <a href="https://github.com/EBISPOT/OLS/issues">GitHub issue</a>. For announcements relating to
+                        For feedback, enquiries or suggestion about OLS or to request a new ontology please use
+                        our GitHub <a href="https://github.com/EBISPOT/OLS/issues">issue tracker</a>.
+                        For announcements relating to
                         OLS, such as new releases and new features sign up to the
                         <a href="https://listserver.ebi.ac.uk/mailman/listinfo/ols-announce">OLS announce mailing
                         list</a>
                     </p>
                 </div>
+            </div>
+
+            <div th:if="${debrand} == true" th:inline="text">
+                <p class="about">
+                [[${description}]]
+                </p>
             </div>
         </div>
 
@@ -106,7 +112,7 @@
             </h4>
             <h5>Updated <span th:text="${#calendars.format(summary.getLastUpdated(), 'dd MMM yyyy HH:mm')}">Today at 07:00</span></h5>
             <ul>
-                <li><span th:text="${summary.getNumberOfOntologies()}">102</span> ontologies</li>
+                <li th:inline="text"><span th:text="${summary.getNumberOfOntologies()}">102</span> [[${ontologyAliasPlural.toLowerCase()}]]</li>
                 <li th:if="${summary.getNumberOfTerms() &gt; 0}"><span th:text="${#numbers.formatInteger(summary.getNumberOfTerms(),3,'COMMA')}">102</span> terms</li>
                 <li th:if="${summary.getNumberOfProperties() &gt; 0}"><span th:text="${#numbers.formatInteger(summary.getNumberOfProperties(),3,'COMMA')}">102</span> properties</li>
                 <li th:if="${summary.getNumberOfIndividuals() &gt; 0}"><span th:text="${#numbers.formatInteger(summary.getNumberOfIndividuals(),3,'COMMA')}">102</span> individuals</li>

@@ -1,13 +1,17 @@
 package uk.ac.ebi.spot.ols.loader;
 
+import com.google.common.collect.Multimap;
 import org.semanticweb.owlapi.apibinding.OWLManager;
+import org.semanticweb.owlapi.io.OWLObjectRenderer;
+import org.semanticweb.owlapi.manchestersyntax.renderer.ManchesterOWLSyntaxOWLObjectRendererImpl;
 import org.semanticweb.owlapi.model.*;
 import org.semanticweb.owlapi.reasoner.OWLReasoner;
+import org.semanticweb.owlapi.search.EntitySearcher;
 import org.semanticweb.owlapi.util.AnnotationValueShortFormProvider;
 import org.semanticweb.owlapi.util.ShortFormProvider;
 import org.semanticweb.owlapi.util.SimpleIRIMapper;
 import org.semanticweb.owlapi.vocab.OWLRDFVocabulary;
-import org.springframework.beans.factory.annotation.Autowired;
+import org.slf4j.Logger;
 import org.springframework.core.io.Resource;
 import org.springframework.core.io.UrlResource;
 import org.springframework.util.StringUtils;
@@ -19,14 +23,13 @@ import uk.ac.ebi.spot.ols.exception.OntologyLoadingException;
 import uk.ac.ebi.spot.ols.renderer.OWLHTMLVisitor;
 import uk.ac.ebi.spot.ols.util.*;
 import uk.ac.ebi.spot.ols.xrefs.DatabaseService;
-import uk.ac.manchester.cs.owl.owlapi.OWLLiteralImplNoCompression;
-import uk.ac.manchester.cs.owl.owlapi.mansyntaxrenderer.ManchesterOWLSyntaxOWLObjectRendererImpl;
+import uk.ac.ebi.spot.usage.CpuUtils;
+import uk.ac.ebi.spot.usage.MemoryUtils;
+import uk.ac.ebi.spot.usage.ResourceUsage;
 
 import java.io.IOException;
 import java.io.PrintWriter;
 import java.io.StringWriter;
-import java.lang.management.ManagementFactory;
-import java.lang.management.ThreadMXBean;
 import java.net.MalformedURLException;
 import java.net.URL;
 import java.text.ParseException;
@@ -36,6 +39,7 @@ import java.util.concurrent.Callable;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 import java.util.stream.Collectors;
+import java.util.stream.Stream;
 
 /**
  * @author Tony Burdett
@@ -61,6 +65,8 @@ AbstractOWLOntologyLoader extends Initializable implements OntologyLoader {
     private String ontologyDescription;
     private String ontologyHomePage;
     private String ontologyMailingList;
+    private String ontologyTracker;
+    private String ontologyLogo;
     private String version;
     private Collection<String> ontologyCreators;
     private Map<String, Collection<String>> ontologyAnnotations;
@@ -200,6 +206,7 @@ AbstractOWLOntologyLoader extends Initializable implements OntologyLoader {
 
     public AbstractOWLOntologyLoader(OntologyResourceConfig config) throws OntologyLoadingException {
         this(config, null, null);
+        OWLObjectRenderer o;
     }
 
     public AbstractOWLOntologyLoader(OntologyResourceConfig config, DatabaseService databaseService,
@@ -230,6 +237,8 @@ AbstractOWLOntologyLoader extends Initializable implements OntologyLoader {
         setOntologyDescription(config.getDescription());
         setOntologyHomePage(config.getHomepage());
         setOntologyMailingList(config.getMailingList());
+        setOntologyTracker(config.getTracker());
+        setOntologyLogo(config.getLogo());
         setOntologyCreators(config.getCreators());
 
 
@@ -274,7 +283,9 @@ AbstractOWLOntologyLoader extends Initializable implements OntologyLoader {
     
     private void initializeOWLAPIWithoutReasoner() throws OntologyLoadingException {
         this.manager = OWLManager.createOWLOntologyManager();
-        this.manager.setSilentMissingImportsHandling(true);
+        OWLOntologyLoaderConfiguration config = new OWLOntologyLoaderConfiguration();
+        config = config.setMissingImportHandlingStrategy(MissingImportHandlingStrategy.THROW_EXCEPTION);
+        this.manager.setOntologyLoaderConfiguration(config);
 
         if (getOntologyResource() != null) {
         	try {
@@ -353,6 +364,7 @@ AbstractOWLOntologyLoader extends Initializable implements OntologyLoader {
         // nothing to do
     }
 
+
     /**
      * Extracts and loads into memory all the class labels and corresponding IRIs.  This class makes the assumption that
      * one primary label per class exists. If any classes contain multiple rdfs:labels, these classes are ignored.
@@ -368,19 +380,20 @@ AbstractOWLOntologyLoader extends Initializable implements OntologyLoader {
     protected OWLOntology loadOntology() throws OWLOntologyCreationException {
         try {
             getLogger().debug("Loading ontology...");
+            ResourceUsage.logUsage(getLogger(), "#### Monitoring ",
+                    getOntologyIRI().getShortForm() + ":Before loading ontology", ":");
             this.ontology = getManager().loadOntology(getOntologyIRI());
-            IRI actualOntologyIRI = ontology.getOntologyID().getOntologyIRI();
-
+            Optional<IRI> actualOntologyIRI = ontology.getOntologyID().getOntologyIRI();
 
             // set
-            if (actualOntologyIRI!=null) {
-                if (!actualOntologyIRI.equals(IRI.create("http://purl.obolibrary.org/obo/TEMP"))) {
-                    setOntologyIRI(actualOntologyIRI);
+            if (actualOntologyIRI.isPresent()) {
+                if (!actualOntologyIRI.get().equals(IRI.create("http://purl.obolibrary.org/obo/TEMP"))) {
+                    setOntologyIRI(actualOntologyIRI.get());
                 }
             }
 
-            if (ontology.getOntologyID().getVersionIRI() != null) {
-                ontologyVersionIRI = ontology.getOntologyID().getVersionIRI();
+            if (ontology.getOntologyID().getVersionIRI().isPresent()) {
+                ontologyVersionIRI = ontology.getOntologyID().getVersionIRI().get();
 
                 getLogger().debug("Version IRI = " + ontologyVersionIRI);
                 String oboVersion = parseOboVersion(ontologyVersionIRI);
@@ -406,9 +419,13 @@ AbstractOWLOntologyLoader extends Initializable implements OntologyLoader {
                     manager);
             this.manSyntaxRenderer = new ManchesterOWLSyntaxOWLObjectRendererImpl();
             manSyntaxRenderer.setShortFormProvider(provider);
+            ResourceUsage.logUsage(getLogger(), "#### Monitoring ", getOntologyName() +
+                    ":After loading ontology - before running reasoner", ":");
 
             // this call will initialise the reasoner
-            getOWLReasoner(ontology);
+            OWLReasoner reasoner = getOWLReasoner(ontology);
+            ResourceUsage.logUsage(getLogger(), "#### Monitoring ", getOntologyName() +
+                    ":After running reasoner:" + reasoner.getReasonerName(), ":");
 
             // cache all URIs for classes, properties and individuals
             getLogger().debug("Computing indexes...");
@@ -418,8 +435,15 @@ AbstractOWLOntologyLoader extends Initializable implements OntologyLoader {
             for (OWLOntology ontology1 : manager.getOntologies()) {
                 allEntities.addAll(ontology1.getSignature());
             }
+            ResourceUsage.logUsage(getLogger(), "#### Monitoring ", getOntologyName() +
+                    ":After copying of entities", ":");
+
             indexTerms(allEntities);
+            ResourceUsage.logUsage(getLogger(), "#### Monitoring ", getOntologyName() +
+                    ":After index terms", ":");
             indexOntologyAnnotations(ontology.getAnnotations());
+            ResourceUsage.logUsage(getLogger(), "#### Monitoring ", getOntologyName() +
+                    ":After index annotations", ":");
 
             return ontology;
         }
@@ -492,6 +516,24 @@ AbstractOWLOntologyLoader extends Initializable implements OntologyLoader {
                 } else if (theValue.isPresent()) {
                     setOntologyMailingList(theValue.get());
                     internalMetadataProperties.add(OntologyDefaults.MAILINGLIST);
+                }
+            }
+            else if (annotationPropertyIri.toString().equals(OntologyDefaults.TRACKER)) {
+                if (annotationValue != null && annotationValue instanceof  IRI) {
+                    setOntologyTracker( ((IRI) annotationValue).toString());
+                    internalMetadataProperties.add(OntologyDefaults.TRACKER);
+                } else if (theValue.isPresent()) {
+                    setOntologyTracker(theValue.get());
+                    internalMetadataProperties.add(OntologyDefaults.TRACKER);
+                }
+            }
+            else if (annotationPropertyIri.toString().equals(OntologyDefaults.LOGO)) {
+                if (annotationValue != null && annotationValue instanceof  IRI) {
+                    setOntologyLogo( ((IRI) annotationValue).toString());
+                    internalMetadataProperties.add(OntologyDefaults.LOGO);
+                } else if (theValue.isPresent()) {
+                    setOntologyLogo(theValue.get());
+                    internalMetadataProperties.add(OntologyDefaults.LOGO);
                 }
             }
             else if (annotationPropertyIri.toString().equals(OntologyDefaults.HOMEPAGE)) {
@@ -606,14 +648,14 @@ AbstractOWLOntologyLoader extends Initializable implements OntologyLoader {
                 public void visit(OWLNamedIndividual individual) {
 
                     individuals.add(individual.getIRI());
-                 try {
-                    // add types as parents
-                    indexIndividualTypes(individual);
-                    indexPropertyRelations(individual);
+                     try {
+                        // add types as parents
+                        indexIndividualTypes(individual);
+                        indexPropertyRelations(individual);
 
-                } catch(OWLOntologyCreationException e) {
-                    getLogger().error("unable to index individuals, unable to create reasoner", e);
-                }
+                    } catch(OWLOntologyCreationException e) {
+                        getLogger().error("unable to index individuals, unable to create reasoner", e);
+                    }
 
                 }
 
@@ -627,6 +669,11 @@ AbstractOWLOntologyLoader extends Initializable implements OntologyLoader {
                     annotationProperties.add(property.getIRI());
                     indexSubAnnotationPropertyRelations(property);
                 }
+
+                @Override
+                public void doDefault(Object object) {
+
+                }
             });
         }
     }
@@ -639,17 +686,18 @@ AbstractOWLOntologyLoader extends Initializable implements OntologyLoader {
         OWLReasoner reasoner = getOWLReasoner(ontology);
         reasoner.getTypes(individual,true).getFlattened().forEach(c->instanceTypes.add(c.getIRI()));
 
-        for (OWLClassExpression expression : individual.getTypes(ontology)) {
+        EntitySearcher.getTypes(individual, ontology).forEach(expression -> {
             if (expression.isAnonymous())  {
                 if (expression instanceof OWLObjectSomeValuesFrom) {
                     indexIndividualsToExistentialRestriction(instanceClassRelations, instanceRelations,
-                        (OWLObjectSomeValuesFrom) expression);
+                            (OWLObjectSomeValuesFrom) expression);
                 } else if(expression instanceof OWLObjectHasValue) {
                     indexIndividualsToExistentialRestriction(instanceClassRelations, instanceRelations,
-                        (OWLObjectSomeValuesFrom) ((OWLObjectHasValue) expression).asSomeValuesFrom());
+                            (OWLObjectSomeValuesFrom) ((OWLObjectHasValue) expression).asSomeValuesFrom());
                 }
             }
-        }
+        });
+
 
         if (!instanceTypes.isEmpty()) {
             addDirectTypes(individual.getIRI(), instanceTypes);
@@ -703,34 +751,35 @@ AbstractOWLOntologyLoader extends Initializable implements OntologyLoader {
     private void indexSubAnnotationPropertyRelations(OWLAnnotationProperty property) {
 
         Set<IRI> superProperties = new HashSet<>();
-        for (OWLAnnotationProperty owlProperty : property.getSuperProperties(ontology)) {
+        EntitySearcher.getSuperProperties(property, ontology).forEach(owlProperty -> {
             superProperties.add(owlProperty.asOWLAnnotationProperty().getIRI());
-        }
+        });
+
         addDirectParents(property.getIRI(), superProperties);
 
         Set<IRI> subProperties = new HashSet<>();
-        for (OWLAnnotationProperty owlProperty : property.getSubProperties(ontology)) {
+        EntitySearcher.getSubProperties(property, ontology).forEach(owlProperty -> {
             subProperties.add(owlProperty.asOWLAnnotationProperty().getIRI());
-        }
+        });
         addDirectChildren(property.getIRI(), subProperties);
     }
 
     private Set<IRI> findAllDirectAndIndirectSuperProperties(OWLObjectProperty objectProperty,
     		Set<IRI> indirectSuperProperties, Set<OWLOntology> ontologyImportClosure) {
-
-        for (OWLObjectPropertyExpression superObjectPropertyExpression :
-        	objectProperty.getSuperProperties(ontologyImportClosure)) {
-
-            if (!superObjectPropertyExpression.isAnonymous()) {
-                IRI superObjectPropertyIRI = superObjectPropertyExpression.asOWLObjectProperty().getIRI();
-
-                if (!indirectSuperProperties.contains(superObjectPropertyIRI)) {
-
-                    indirectSuperProperties.add(superObjectPropertyIRI);
-                    findAllDirectAndIndirectSuperProperties(superObjectPropertyExpression.asOWLObjectProperty(),
-                            indirectSuperProperties, ontologyImportClosure);
-                }
-            }
+        try {
+            EntitySearcher.getSuperProperties(objectProperty, ontologyImportClosure.stream()).forEach(
+                superObjectPropertyExpression -> {
+                    if (!superObjectPropertyExpression.isAnonymous()) {
+                        IRI superObjectPropertyIRI = superObjectPropertyExpression.asOWLObjectProperty().getIRI();
+                        if (!indirectSuperProperties.contains(superObjectPropertyIRI)) {
+                            indirectSuperProperties.add(superObjectPropertyIRI);
+                            findAllDirectAndIndirectSuperProperties(superObjectPropertyExpression.asOWLObjectProperty(),
+                                    indirectSuperProperties, ontologyImportClosure);
+                        }
+                    }
+                });
+        } catch (Throwable t) {
+           getLogger().error("Problematic object property = " + objectProperty.getIRI(), t);
         }
     	return indirectSuperProperties;
     }
@@ -738,17 +787,20 @@ AbstractOWLOntologyLoader extends Initializable implements OntologyLoader {
     private Set<IRI> findAllDirectAndIndirectSubProperties(OWLObjectProperty objectProperty,
     		Set<IRI> indirectSubProperties, Set<OWLOntology> ontologyImportClosure) {
 
-        for (OWLObjectPropertyExpression subObjectPropertyExpression :
-        	objectProperty.getSubProperties(ontologyImportClosure)) {
+        try {
+            EntitySearcher.getSuperProperties(objectProperty, ontologyImportClosure.stream()).forEach(
+                subObjectPropertyExpression -> {
+                    IRI subObjectPropertyIRI = subObjectPropertyExpression.asOWLObjectProperty().getIRI();
+                    if (!subObjectPropertyExpression.isAnonymous() &&
+                            !indirectSubProperties.contains(subObjectPropertyIRI)) {
 
-        	IRI subObjectPropertyIRI = subObjectPropertyExpression.asOWLObjectProperty().getIRI();
-            if (!subObjectPropertyExpression.isAnonymous() &&
-            		!indirectSubProperties.contains(subObjectPropertyIRI)) {
-
-            	indirectSubProperties.add(subObjectPropertyIRI);
-            	findAllDirectAndIndirectSubProperties(subObjectPropertyExpression.asOWLObjectProperty(),
-            			indirectSubProperties, ontologyImportClosure);
-            }
+                        indirectSubProperties.add(subObjectPropertyIRI);
+                        findAllDirectAndIndirectSubProperties(subObjectPropertyExpression.asOWLObjectProperty(),
+                                indirectSubProperties, ontologyImportClosure);
+                    }
+                });
+        } catch (Throwable t) {
+            getLogger().error("Problematic object property = " + objectProperty.getIRI(), t);
         }
     	return indirectSubProperties;
     }
@@ -761,24 +813,33 @@ AbstractOWLOntologyLoader extends Initializable implements OntologyLoader {
         Set<IRI> indirectSubProperties = new HashSet<>();
 
         Set<OWLOntology> ontologyImportClosure = ontology.getImportsClosure();
-
-        for (OWLObjectPropertyExpression owlProperty : property.getSuperProperties(ontologyImportClosure)) {
-            if (!owlProperty.isAnonymous()) {
-                directSuperProperties.add(owlProperty.asOWLObjectProperty().getIRI());
-            }
+        try {
+            EntitySearcher.getSuperProperties(property, ontologyImportClosure.stream()).filter(
+                owlObjectProperty -> (!owlObjectProperty.isAnonymous() && owlObjectProperty.getInverseProperty() != null)).forEach(
+                owlProperty -> {
+                    directSuperProperties.add(owlProperty.asOWLObjectProperty().getIRI());
+                });
+        } catch (Throwable t) {
+            getLogger().error("Problematic object property = " + property.getIRI(), t);
         }
+
         addDirectParents(property.getIRI(), directSuperProperties);
         addAllParents(property.getIRI(), findAllDirectAndIndirectSuperProperties(property,
         		indirectSuperProperties, ontologyImportClosure));
-        getLogger().debug("indexSubPropertyRelations: " + property + " directSuperProperties = " + directSuperProperties);
-        getLogger().debug("indexSubPropertyRelations: " + property + " indirectSuperProperties = " + indirectSuperProperties);
+//        getLogger().debug("indexSubPropertyRelations: " + property + " directSuperProperties = " + directSuperProperties);
+//        getLogger().debug("indexSubPropertyRelations: " + property + " indirectSuperProperties = " + indirectSuperProperties);
 
         Set<IRI> directSubProperties = new HashSet<>();
-        for (OWLObjectPropertyExpression owlProperty : property.getSubProperties(ontologyImportClosure)) {
-            if (!owlProperty.isAnonymous()) {
-                directSubProperties.add(owlProperty.asOWLObjectProperty().getIRI());
-            }
+        try {
+            EntitySearcher.getSubProperties(property, ontologyImportClosure.stream()).filter(
+                owlObjectProperty -> !owlObjectProperty.isAnonymous()).forEach(
+                owlProperty -> {
+                    directSubProperties.add(owlProperty.asOWLObjectProperty().getIRI());
+                });
+        } catch (Throwable t) {
+            getLogger().error("Problematic object property = " + property.getIRI());
         }
+
         addDirectChildren(property.getIRI(), directSubProperties);
         addAllParents(property.getIRI(), findAllDirectAndIndirectSubProperties(property,
         		indirectSubProperties, ontologyImportClosure));
@@ -788,7 +849,7 @@ AbstractOWLOntologyLoader extends Initializable implements OntologyLoader {
 
 
     protected  void indexSubclassRelations(OWLClass owlClass) throws OWLOntologyCreationException {
-
+        getLogger().debug("indexSubclassRelations {}", owlClass);
         OWLReasoner reasoner = getOWLReasoner(ontology);
 
         Set<OWLClass> directSubClasses = reasoner.getSubClasses(owlClass, true).getFlattened();
@@ -798,6 +859,7 @@ AbstractOWLOntologyLoader extends Initializable implements OntologyLoader {
 
         // use reasoner to check if root
         if (directSuperClasses.contains(getFactory().getOWLThing())) {
+            getLogger().debug("indexSubclassRelations add root for {}", owlClass);
             addRootsTerms(owlClass.getIRI());
         }
 
@@ -812,6 +874,7 @@ AbstractOWLOntologyLoader extends Initializable implements OntologyLoader {
                         .map(OWLNamedObject::getIRI)
                         .collect(Collectors.toSet()),
                 owlVocabulary);
+//        getLogger().debug("indexSubclassRelations directChildTerms for {} count  {}", owlClass, directChildTerms.size());
         if (directChildTerms.size() > 0)
           addDirectChildren(owlClass.getIRI(), directChildTerms) ;
 
@@ -854,54 +917,57 @@ AbstractOWLOntologyLoader extends Initializable implements OntologyLoader {
         Map<IRI,Collection<IRI>> relatedIndividualsToClasses = new HashMap<>();
 
         Set<String> relatedDescriptions = new HashSet<>();
-        for (OWLClassExpression expression : owlClass.getSuperClasses(getManager().getOntologies())) {
-            // only want existential with named class as filler
-            if (expression.isAnonymous()) {
 
-                if (expression instanceof OWLObjectSomeValuesFrom) {
+        EntitySearcher.getSuperClasses(owlClass, getManager().ontologies()).forEach(expression -> {
 
-                    OWLObjectSomeValuesFrom someValuesFrom = (OWLObjectSomeValuesFrom) expression;
+                // only want existential with named class as filler
+                if (expression.isAnonymous()) {
 
-                    if (!someValuesFrom.getFiller().isAnonymous() && ! someValuesFrom.getProperty().isAnonymous()) {
-                        IRI propertyIRI = someValuesFrom.getProperty().asOWLObjectProperty().getIRI();
-                        IRI relatedTerm = someValuesFrom.getFiller().asOWLClass().getIRI();
+                    if (expression instanceof OWLObjectSomeValuesFrom) {
 
-                        // skip terms that are related to themselves as this can cause nasty cycles
+                        OWLObjectSomeValuesFrom someValuesFrom = (OWLObjectSomeValuesFrom) expression;
 
-                        if (!relatedTerms.containsKey(propertyIRI)) {
-                            relatedTerms.put(propertyIRI, new HashSet<>());
-                        }
-                        relatedTerms.get(propertyIRI).add(relatedTerm);
+                        if (!someValuesFrom.getFiller().isAnonymous() && ! someValuesFrom.getProperty().isAnonymous()) {
+                            IRI propertyIRI = someValuesFrom.getProperty().asOWLObjectProperty().getIRI();
+                            IRI relatedTerm = someValuesFrom.getFiller().asOWLClass().getIRI();
 
-                        // check if hierarchical
-                        if (hierarchicalRels.contains(propertyIRI) || isPartOf(propertyIRI) ) {
-                            if (owlClass.getIRI().equals(relatedTerm)) {
-                                getLogger().warn("Ignoring Iri that is related to itself: " + owlClass.getIRI());
-                            } else  {
-                                if (!relatedParentTerms.containsKey(propertyIRI)) {
-                                    relatedParentTerms.put(propertyIRI, new HashSet<>());
+                            // skip terms that are related to themselves as this can cause nasty cycles
+
+                            if (!relatedTerms.containsKey(propertyIRI)) {
+                                relatedTerms.put(propertyIRI, new HashSet<>());
+                            }
+                            relatedTerms.get(propertyIRI).add(relatedTerm);
+
+                            // check if hierarchical
+                            if (hierarchicalRels.contains(propertyIRI) || isPartOf(propertyIRI) ) {
+                                if (owlClass.getIRI().equals(relatedTerm)) {
+                                    getLogger().warn("Ignoring Iri that is related to itself: " + owlClass.getIRI());
+                                } else  {
+                                    if (!relatedParentTerms.containsKey(propertyIRI)) {
+                                        relatedParentTerms.put(propertyIRI, new HashSet<>());
+                                    }
+                                    relatedParentTerms.get(propertyIRI).add(relatedTerm);
+                                    addRelatedChildTerm(relatedTerm, owlClass.getIRI());
                                 }
-                                relatedParentTerms.get(propertyIRI).add(relatedTerm);
-                                addRelatedChildTerm(relatedTerm, owlClass.getIRI());
+
+
                             }
 
-
+                        } else if (someValuesFrom.getFiller().isAnonymous() && !someValuesFrom.getProperty().isAnonymous()) {
+                            indexTermToIndividualRelations(someValuesFrom,relatedIndividualsToClasses);
                         }
 
-                    } else if (someValuesFrom.getFiller().isAnonymous() && !someValuesFrom.getProperty().isAnonymous()) {
+                    } else if (expression instanceof OWLObjectHasValue) {
+                        OWLObjectSomeValuesFrom someValuesFrom = (OWLObjectSomeValuesFrom)((OWLObjectHasValue) expression).asSomeValuesFrom();
                         indexTermToIndividualRelations(someValuesFrom,relatedIndividualsToClasses);
                     }
 
-                } else if (expression instanceof OWLObjectHasValue) {
-                    OWLObjectSomeValuesFrom someValuesFrom = (OWLObjectSomeValuesFrom)((OWLObjectHasValue) expression).asSomeValuesFrom();
-                    indexTermToIndividualRelations(someValuesFrom,relatedIndividualsToClasses);
+
+                    // store stringified form of class description
+                    relatedDescriptions.add(renderHtml(expression));
                 }
+        });
 
-
-                // store stringified form of class description
-                relatedDescriptions.add(renderHtml(expression));
-            }
-        }
         if (!relatedTerms.isEmpty()) {
             addRelatedTerms(owlClass.getIRI(), relatedTerms );
         }
@@ -975,11 +1041,12 @@ AbstractOWLOntologyLoader extends Initializable implements OntologyLoader {
 
         Set<String> relatedDescriptions = new HashSet<>();
 
-        for (OWLClassExpression expression : owlClass.getEquivalentClasses(getManager().getOntologies())) {
-            if (expression.isAnonymous()) {
-                relatedDescriptions.add(renderHtml(expression));
-            }
-        }
+        EntitySearcher.getEquivalentClasses(owlClass, getManager().ontologies())
+                .forEach(expression -> {
+                    if (expression.isAnonymous()) {
+                        relatedDescriptions.add(renderHtml(expression));
+                    }
+                });
 
         if (!relatedDescriptions.isEmpty()) {
             addEquivalentClassDescriptions(owlClass.getIRI(), relatedDescriptions);
@@ -1001,8 +1068,8 @@ AbstractOWLOntologyLoader extends Initializable implements OntologyLoader {
     }
 
     private void extractAssertedRelationsFromIndividualObjectPropertyAssertions(OWLNamedIndividual individual, Map<IRI, Collection<IRI>> instanceInstanceRelations) {
-        // <i1,i2>:R (ObjectPropertyAssertions
-        Map<OWLObjectPropertyExpression,Set<OWLIndividual>> assertedRelations = individual.getObjectPropertyValues(ontology);
+        Multimap<OWLObjectPropertyExpression, OWLIndividual> assertedRelations =
+                EntitySearcher.getObjectPropertyValues(individual, ontology);
 
         for (OWLObjectPropertyExpression rel : assertedRelations.keySet()) {
             if(!rel.isAnonymous()) {
@@ -1059,6 +1126,11 @@ AbstractOWLOntologyLoader extends Initializable implements OntologyLoader {
      */
     protected Optional<String> extractShortForm(IRI entityIRI) {
         getLogger().trace("Attempting to extract fragment name of IRI '" + entityIRI + "'");
+
+        // special case for URN schemes: https://www.w3.org/Addressing/URL/URI_URN.html
+        if(entityIRI.toString().startsWith("urn:")) {
+            return Optional.of(entityIRI.toString().substring(4));
+        }
 
         // oput in try block to catch any URL exceptins
         try {
@@ -1147,132 +1219,129 @@ AbstractOWLOntologyLoader extends Initializable implements OntologyLoader {
         Collection<OBOXref> oboEntityXrefs = new HashSet<>();
 
         // loop through other annotations in the imports closure
-        for (OWLOntology anOntology : getManager().getOntologies()) {
-            for (OWLAnnotationAssertionAxiom annotationAssertionAxiom :
-            		owlEntity.getAnnotationAssertionAxioms(anOntology)) {
+        for (OWLOntology anOntology : getManager().ontologies().collect(Collectors.toSet())){
+                EntitySearcher.getAnnotationAssertionAxioms(owlEntity, anOntology).forEach(annotationAssertionAxiom -> {
+                        OWLAnnotationProperty annotationProperty = annotationAssertionAxiom.getProperty();
+                        IRI annotationPropertyIRI = annotationProperty.getIRI();
 
-                OWLAnnotationProperty annotationProperty = annotationAssertionAxiom.getProperty();
-                IRI annotationPropertyIRI = annotationProperty.getIRI();
-
-                if (getLabelIRI().equals(annotationPropertyIRI)) {
-                    if (!ontologyLabels.containsKey(owlEntityIRI)) {
-                        addClassLabel(owlEntityIRI, evaluateLabelAnnotationValue(
-                        		owlEntity, annotationAssertionAxiom.getValue()).get());
-                    } else {
-                        getLogger().warn("Found multiple labels for class" + owlEntityIRI.toString());
-                        // if english, overide previous label
-                        if (isEnglishLabel(annotationAssertionAxiom.getValue())) {
-                            addClassLabel(owlEntityIRI, evaluateLabelAnnotationValue(
-                            		owlEntity, annotationAssertionAxiom.getValue()).get());
-                        }
-                    }
-                }
-                else if (getSynonymIRIs().contains(annotationPropertyIRI)) {
-                    synonyms.add(getOWLAnnotationValueAsString(annotationAssertionAxiom.getValue()).get());
-                }
-                else if (getDefinitionIRIs().contains(annotationPropertyIRI)) {
-                    definitions.add(getOWLAnnotationValueAsString(annotationAssertionAxiom.getValue()).get());
-                }
-                else if (annotationPropertyIRI.equals(Namespaces.OBOINOWL.createIRI("inSubset")) && annotationAssertionAxiom.getValue() instanceof IRI) {
-                    if (extractShortForm( (IRI) annotationAssertionAxiom.getValue()).isPresent()) {
-                        slims.add(extractShortForm( (IRI) annotationAssertionAxiom.getValue()).get());
-                    }
-                }
-                else if (annotationPropertyIRI.equals(Namespaces.OWL.createIRI("deprecated"))) {
-                    addObsoleteTerms(owlEntityIRI);
-                }
-                else {
-                    if (getOWLAnnotationValueAsString(annotationAssertionAxiom.getValue()).isPresent()) {
-                        // initialise maps if first time
-                        if (!termAnnotations.containsKey(owlEntityIRI)) {
-                            HashMap<IRI, Collection<String>> newMap = new HashMap<>();
-                            newMap.put(annotationPropertyIRI, new HashSet<>());
-                            termAnnotations.put(owlEntityIRI, newMap);
-                        }
-
-                        if (!termAnnotations.get(owlEntityIRI).containsKey(annotationPropertyIRI)) {
-                            termAnnotations.get(owlEntityIRI).put(annotationPropertyIRI, new HashSet<>());
-                        }
-
-                        if (annotationAssertionAxiom.getValue() instanceof IRI) {
-                            termAnnotations.get(owlEntityIRI).get(annotationPropertyIRI).add(annotationAssertionAxiom.getValue().toString());
-                        }
-                        else {
-                            termAnnotations.get(owlEntityIRI).get(annotationPropertyIRI).add(getOWLAnnotationValueAsString(annotationAssertionAxiom.getValue()).get());
-                        }
-                    }
-                }
-
-                // pull out term replaced by
-                if (annotationPropertyIRI.equals(Namespaces.OBO.createIRI("IAO_0100001"))) {
-                    addTermReplacedBy(owlEntityIRI, getOWLAnnotationValueAsString(annotationAssertionAxiom.getValue()).get());
-                }
-
-                // collect any obo definition xrefs
-                if (annotationAssertionAxiom.getProperty().getIRI().toString().equals(OboDefaults.DEFINITION)) {
-                    if (!annotationAssertionAxiom.getAnnotations().isEmpty()) {
-
-                        OBODefinitionCitation definitionCitation = new OBODefinitionCitation();
-                        Collection<OBOXref> oboXrefs = new HashSet<>();
-                        for (OWLAnnotation defAnnotation : annotationAssertionAxiom.getAnnotations()) {
-                            oboXrefs.add(extractOBOXrefs(defAnnotation));
-                        }
-                        definitionCitation.setDefinition(getOWLAnnotationValueAsString(annotationAssertionAxiom.getValue()).get());
-                        definitionCitation.setOboXrefs(oboXrefs);
-                        definitionCitations.add(definitionCitation);
-                    }
-                }
-
-                // collect any obo synonym xrefs
-                if (
-                        annotationAssertionAxiom.getProperty().getIRI().toString().equals(OboDefaults.EXACT_SYNONYM)
-                                || annotationAssertionAxiom.getProperty().getIRI().toString().equals(OboDefaults.RELATED_SYNONYM)
-                                || annotationAssertionAxiom.getProperty().getIRI().toString().equals(OboDefaults.NARROW_SYNONYM)
-                                || annotationAssertionAxiom.getProperty().getIRI().toString().equals(OboDefaults.BROAD_SYNONYM)
-
-                        ) {
-                    if (!annotationAssertionAxiom.getAnnotations().isEmpty()) {
-
-                        OBOSynonym synonymCitation = new OBOSynonym();
-
-                        synonymCitation.setName(getOWLAnnotationValueAsString(annotationAssertionAxiom.getValue()).get());
-                        synonymCitation.setScope(annotationAssertionAxiom.getProperty().getIRI().getShortForm());
-                        String type;
-                        Collection<OBOXref> oboXrefs = new HashSet<>();
-                        for (OWLAnnotation annotationAxiomAnnotation : annotationAssertionAxiom.getAnnotations()) {
-                            if (annotationAxiomAnnotation.getProperty().getIRI().toString().equals(OboDefaults.SYNONYM_TYPE)) {
-                                OWLAnnotationValue value = annotationAxiomAnnotation.getValue();
-                                if (value instanceof IRI) {
-                                    for (OWLAnnotation valueAnnotation : factory.getOWLAnnotationProperty((IRI) value).getAnnotations(ontology)) {
-                                        if (valueAnnotation.getProperty().getIRI().equals(OWLRDFVocabulary.RDFS_LABEL.getIRI())) {
-                                            type = getOWLAnnotationValueAsString(valueAnnotation.getValue()).get();
-                                            synonymCitation.setType(type);
-                                        }
-                                    }
+                        if (getLabelIRI().equals(annotationPropertyIRI)) {
+                            if (!ontologyLabels.containsKey(owlEntityIRI)) {
+                                addClassLabel(owlEntityIRI, evaluateLabelAnnotationValue(
+                                        owlEntity, annotationAssertionAxiom.getValue()).get());
+                            } else {
+                                getLogger().warn("Found multiple labels for class" + owlEntityIRI.toString());
+                                // if english, overide previous label
+                                if (isEnglishLabel(annotationAssertionAxiom.getValue())) {
+                                    addClassLabel(owlEntityIRI, evaluateLabelAnnotationValue(
+                                            owlEntity, annotationAssertionAxiom.getValue()).get());
                                 }
                             }
-                            if (annotationAxiomAnnotation.getProperty().getIRI().toString().equals(OboDefaults.DBXREF)) {
-                                oboXrefs.add(extractOBOXrefs(annotationAxiomAnnotation));
+                        }
+                        else if (getSynonymIRIs().contains(annotationPropertyIRI)) {
+                            synonyms.add(getOWLAnnotationValueAsString(annotationAssertionAxiom.getValue()).get());
+                        }
+                        else if (getDefinitionIRIs().contains(annotationPropertyIRI)) {
+                            definitions.add(getOWLAnnotationValueAsString(annotationAssertionAxiom.getValue()).get());
+                        }
+                        else if (annotationPropertyIRI.equals(Namespaces.OBOINOWL.createIRI("inSubset")) && annotationAssertionAxiom.getValue() instanceof IRI) {
+                            if (extractShortForm( (IRI) annotationAssertionAxiom.getValue()).isPresent()) {
+                                slims.add(extractShortForm( (IRI) annotationAssertionAxiom.getValue()).get());
                             }
                         }
-                        synonymCitation.setXrefs(oboXrefs);
-                        oboSynonyms.add(synonymCitation);
-                    }
-                }
-
-                // collect any obo  xrefs
-                if (annotationAssertionAxiom.getProperty().getIRI().toString().equals(OboDefaults.DBXREF)) {
-                    OBOXref oboXrefs = extractOBOXrefs(annotationAssertionAxiom.getAnnotation());
-                    if (!annotationAssertionAxiom.getAnnotations().isEmpty()) {
-                        for (OWLAnnotation axiomAnnotation : annotationAssertionAxiom.getAnnotations()) {
-                            String description = getOWLAnnotationValueAsString(axiomAnnotation.getValue()).get();
-                            oboXrefs.setDescription(description);
+                        else if (annotationPropertyIRI.equals(Namespaces.OWL.createIRI("deprecated"))) {
+                            addObsoleteTerms(owlEntityIRI);
                         }
-                    }
-                    oboEntityXrefs.add(oboXrefs);
-                }
+                        else {
+                            if (getOWLAnnotationValueAsString(annotationAssertionAxiom.getValue()).isPresent()) {
+                                // initialise maps if first time
+                                if (!termAnnotations.containsKey(owlEntityIRI)) {
+                                    HashMap<IRI, Collection<String>> newMap = new HashMap<>();
+                                    newMap.put(annotationPropertyIRI, new HashSet<>());
+                                    termAnnotations.put(owlEntityIRI, newMap);
+                                }
 
-            }
+                                if (!termAnnotations.get(owlEntityIRI).containsKey(annotationPropertyIRI)) {
+                                    termAnnotations.get(owlEntityIRI).put(annotationPropertyIRI, new HashSet<>());
+                                }
+
+                                if (annotationAssertionAxiom.getValue() instanceof IRI) {
+                                    termAnnotations.get(owlEntityIRI).get(annotationPropertyIRI).add(annotationAssertionAxiom.getValue().toString());
+                                }
+                                else {
+                                    termAnnotations.get(owlEntityIRI).get(annotationPropertyIRI).add(getOWLAnnotationValueAsString(annotationAssertionAxiom.getValue()).get());
+                                }
+                            }
+                        }
+
+                        // pull out term replaced by
+                        if (annotationPropertyIRI.equals(Namespaces.OBO.createIRI("IAO_0100001"))) {
+                            addTermReplacedBy(owlEntityIRI, getOWLAnnotationValueAsString(annotationAssertionAxiom.getValue()).get());
+                        }
+
+                        // collect any obo definition xrefs
+                        if (annotationAssertionAxiom.getProperty().getIRI().toString().equals(OboDefaults.DEFINITION)) {
+                            if (!annotationAssertionAxiom.getAnnotations().isEmpty()) {
+
+                                OBODefinitionCitation definitionCitation = new OBODefinitionCitation();
+                                Collection<OBOXref> oboXrefs = new HashSet<>();
+                                for (OWLAnnotation defAnnotation : annotationAssertionAxiom.getAnnotations()) {
+                                    oboXrefs.add(extractOBOXrefs(defAnnotation));
+                                }
+                                definitionCitation.setDefinition(getOWLAnnotationValueAsString(annotationAssertionAxiom.getValue()).get());
+                                definitionCitation.setOboXrefs(oboXrefs);
+                                definitionCitations.add(definitionCitation);
+                            }
+                        }
+
+                        // collect any obo synonym xrefs
+                        if (
+                                annotationAssertionAxiom.getProperty().getIRI().toString().equals(OboDefaults.EXACT_SYNONYM)
+                                        || annotationAssertionAxiom.getProperty().getIRI().toString().equals(OboDefaults.RELATED_SYNONYM)
+                                        || annotationAssertionAxiom.getProperty().getIRI().toString().equals(OboDefaults.NARROW_SYNONYM)
+                                        || annotationAssertionAxiom.getProperty().getIRI().toString().equals(OboDefaults.BROAD_SYNONYM)
+
+                        ) {
+                            if (!annotationAssertionAxiom.getAnnotations().isEmpty()) {
+
+                                OBOSynonym synonymCitation = new OBOSynonym();
+
+                                synonymCitation.setName(getOWLAnnotationValueAsString(annotationAssertionAxiom.getValue()).get());
+                                synonymCitation.setScope(annotationAssertionAxiom.getProperty().getIRI().getShortForm());
+                                Collection<OBOXref> oboXrefs = new HashSet<>();
+                                for (OWLAnnotation annotationAxiomAnnotation : annotationAssertionAxiom.getAnnotations()) {
+                                    if (annotationAxiomAnnotation.getProperty().getIRI().toString().equals(OboDefaults.SYNONYM_TYPE)) {
+                                        OWLAnnotationValue value = annotationAxiomAnnotation.getValue();
+                                        if (value instanceof IRI) {
+                                            OWLAnnotationProperty owlAnnotationProperty = factory.getOWLAnnotationProperty((IRI) value);
+                                            EntitySearcher.getAnnotations(owlAnnotationProperty, ontology).forEach(valueAnnotation -> {
+                                                if (valueAnnotation.getProperty().getIRI().equals(OWLRDFVocabulary.RDFS_LABEL.getIRI())) {
+                                                    String type = getOWLAnnotationValueAsString(valueAnnotation.getValue()).get();
+                                                    synonymCitation.setType(type);
+                                                }
+                                            });
+                                        }
+                                    }
+                                    if (annotationAxiomAnnotation.getProperty().getIRI().toString().equals(OboDefaults.DBXREF)) {
+                                        oboXrefs.add(extractOBOXrefs(annotationAxiomAnnotation));
+                                    }
+                                }
+                                synonymCitation.setXrefs(oboXrefs);
+                                oboSynonyms.add(synonymCitation);
+                            }
+                        }
+
+                        // collect any obo  xrefs
+                        if (annotationAssertionAxiom.getProperty().getIRI().toString().equals(OboDefaults.DBXREF)) {
+                            OBOXref oboXrefs = extractOBOXrefs(annotationAssertionAxiom.getAnnotation());
+                            if (!annotationAssertionAxiom.getAnnotations().isEmpty()) {
+                                for (OWLAnnotation axiomAnnotation : annotationAssertionAxiom.getAnnotations()) {
+                                    String description = getOWLAnnotationValueAsString(axiomAnnotation.getValue()).get();
+                                    oboXrefs.setDescription(description);
+                                }
+                            }
+                            oboEntityXrefs.add(oboXrefs);
+                        }
+                });
         }
 
         if (definitionCitations.size() > 0) {
@@ -1355,8 +1424,10 @@ AbstractOWLOntologyLoader extends Initializable implements OntologyLoader {
 
         if (value instanceof IRI) {
             Optional<String> shortForm= extractShortForm((IRI) value);
-            if ( shortForm.isPresent()) {
+            if ( shortForm.isPresent() && !shortForm.get().isEmpty()) {
                 return Optional.of(shortForm.get());
+            } else {
+                return Optional.of( ((IRI) value).toString() );
             }
         }
         else if (value instanceof OWLLiteral) {
@@ -1942,6 +2013,15 @@ AbstractOWLOntologyLoader extends Initializable implements OntologyLoader {
         this.ontologyMailingList = ontologyMailingList;
     }
 
+    public void setOntologyTracker(String ontologyTracker) {
+        this.ontologyTracker = ontologyTracker;
+    }
+
+    public void setOntologyLogo(String ontologyLogo) {
+        this.ontologyLogo = ontologyLogo;
+    }
+
+
     public void setOntologyVersion(String version) {
         this.version = version;
     }
@@ -1974,6 +2054,14 @@ AbstractOWLOntologyLoader extends Initializable implements OntologyLoader {
 
     public String getMailingList() {
         return ontologyMailingList;
+    }
+
+    public String getTracker() {
+        return ontologyTracker;
+    }
+
+    public String getLogo() {
+        return ontologyLogo;
     }
 
     public Collection<String> getCreators() {

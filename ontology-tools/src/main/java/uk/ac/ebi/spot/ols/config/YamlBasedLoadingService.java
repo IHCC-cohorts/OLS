@@ -75,6 +75,8 @@ public class YamlBasedLoadingService extends AbstractLoadingService {
             populateDescription(builder);
             populateHomepage(builder);
             populateMailingList(builder);
+            populateTracker(builder);
+            populateLogo(builder);
             populateCreator(builder);
             populatePreferredRootTerms(builder);
             populateAllowDownload(builder);
@@ -115,6 +117,17 @@ public class YamlBasedLoadingService extends AbstractLoadingService {
         }
     }
 
+    private void populateTracker(OntologyResourceConfig.OntologyResourceConfigBuilder builder) {
+        if (ontology.containsKey(TRACKER.getPropertyName())) {
+            builder.setTracker((String) ontology.get(TRACKER.getPropertyName()));
+        }
+    }
+    private void populateLogo(OntologyResourceConfig.OntologyResourceConfigBuilder builder) {
+        if (ontology.containsKey(LOGO.getPropertyName())) {
+            builder.setLogo((String) ontology.get(LOGO.getPropertyName()));
+        }
+    }
+
     private void populateHomepage(OntologyResourceConfig.OntologyResourceConfigBuilder builder) {
         if (ontology.containsKey(HOMEPAGE.getPropertyName())) {
             if (ontology.get(HOMEPAGE.getPropertyName()) instanceof ArrayList) {
@@ -147,13 +160,14 @@ public class YamlBasedLoadingService extends AbstractLoadingService {
             ReasonerType type = ReasonerType.valueOf(reasonerType.toUpperCase());
             if (type == null) {
                 log.warn("Unknown reasoner type, defaulting to structural reasoner " + reasonerType);
+                builder.setReasonerType(ReasonerType.NONE);
             }
             else  {
                 builder.setReasonerType(type);
             }
         }
         else if (isObo) {
-            builder.setReasonerType(ReasonerType.EL);
+            builder.setReasonerType(ReasonerType.NONE);
         }
     }
 
