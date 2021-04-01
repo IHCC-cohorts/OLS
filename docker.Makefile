@@ -1,6 +1,6 @@
 
 # Building docker image
-VERSION = "0.0.2"
+VERSION = "0.0.3"
 PRODUCT=ols-web
 IM=ihcc/$(PRODUCT)
 
